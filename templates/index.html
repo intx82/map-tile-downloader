@@ -8,6 +8,7 @@
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.1/socket.io.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" crossorigin="anonymous" />
     <style>
         body, html {
             margin: 0;
@@ -140,6 +141,76 @@
         map.on('draw:edited', function() {
             saveSettings();
         });
+
+        var ioControl = L.control({ position: 'topleft' });
+
+        ioControl.onAdd = function (map) {
+            var container = L.DomUtil.create('div', 'custom-control leaflet-bar');
+            var exportButton = L.DomUtil.create('a', '', container);
+            exportButton.innerHTML = '<i class="fa-solid fa-floppy-disk"></i>';
+            L.DomEvent.on(exportButton, 'click', function () {
+                var geojson = drawnItems.toGeoJSON();
+                var geojsonStr = JSON.stringify(geojson, null, 2);
+                var blob = new Blob([geojsonStr], { type: 'application/json' });
+                var link = document.createElement('a');
+                link.href = URL.createObjectURL(blob);
+                link.download = 'drawings.json';
+                link.click();
+            });
+            var importButton = L.DomUtil.create('a', '', container);
+            importButton.innerHTML = '<i class="fa-solid fa-folder-open"></i>';
+            L.DomEvent.on(importButton, 'click', function () {
+                var input = document.createElement('input');
+                input.type = 'file';
+                input.accept = '.json,.geojson,application/geo+json,application/json';
+                input.style.display = 'none';
+                input.addEventListener('change', function (event) {
+                    var file = event.target.files[0];
+                    if (!file) return;
+                    var reader = new FileReader();
+                    reader.onload = function(e) {
+                        try {
+                            var geojson = JSON.parse(e.target.result);
+                            if (!geojson || !geojson.features || !Array.isArray(geojson.features)) {
+                                alert('Invalid GeoJSON format: No valid features found.');
+                                return;
+                            }
+                            geojson.features.forEach(feature => {
+                                if (!feature.geometry) return;
+                                const type = feature.geometry.type;
+                                const coords = feature.geometry.coordinates;
+                                if (type === 'Polygon') {
+                                    const latlngs = coords[0].map(coord => [coord[1], coord[0]]);
+                                    const polygon = L.polygon(latlngs);
+                                    drawnItems.addLayer(polygon);
+                                } else if (type === 'MultiPolygon') {
+                                    coords.forEach(poly => {
+                                        const latlngs = poly[0].map(coord => [coord[1], coord[0]]);
+                                        const polygon = L.polygon(latlngs);
+                                        drawnItems.addLayer(polygon);
+                                    });
+                                }
+                            });
+                            if (drawnItems.getLayers().length > 0) {
+                                map.fitBounds(drawnItems.getBounds());
+                                document.getElementById('downloadBtn').disabled = false;
+                            } else {
+                                alert('No Polygon or MultiPolygon features found.');
+                            }
+                        } catch (err) {
+                            alert('Failed to read GeoJSON file: ' + err.message);
+                        }
+                    };
+                    reader.readAsText(file);
+                });
+                document.body.appendChild(input);
+                input.click();
+                document.body.removeChild(input);
+            });
+            return container;
+        };
+
+        ioControl.addTo(map);
 
         // Create layer groups
         var missingTilesLayer = L.layerGroup().addTo(map);
