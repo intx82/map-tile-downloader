@@ -294,6 +294,7 @@
                 map_style: document.getElementById('map_style').value,
                 convert_to_8bit: document.getElementById('convert_to_8bit').checked
             };
+            document.getElementById('progress').innerHTML = "Calculating Tiles To Download...";
             socket.emit('start_download', data);
         });
 
@@ -301,6 +302,7 @@
         document.getElementById('downloadWorldBtn').addEventListener('click', function() {
             var mapStyleUrl = document.getElementById('map_style').value;
             var convertTo8bit = document.getElementById('convert_to_8bit').checked;
+            document.getElementById('progress').innerHTML = "Calculating Tiles To Download...";
             socket.emit('start_world_download', {map_style: mapStyleUrl, convert_to_8bit: convertTo8bit});
         });
 
