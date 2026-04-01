@@ -78,6 +78,21 @@ Adding a New Map Source: Simply add a new key-value pair to the JSON file with t
 	
 	Specify the minimum and maximum zoom levels for the tiles you wish to download.
 
+	> **Tile count reference** — the app enforces a 100,000 tile limit per download.
+	> Use this table as a guide when choosing zoom ranges:
+	>
+	> | Area size | Zoom range | Approx. tiles |
+	> |-----------|------------|---------------|
+	> | City | 10 – 14 | ~5,000 |
+	> | State / Region | 8 – 12 | ~20,000 |
+	> | Country (e.g. US) | 0 – 10 | ~18,000 |
+	> | Country (e.g. US) | 0 – 12 | ~80,000 |
+	> | Country (e.g. US) | 0 – 13 | ~320,000 ⚠️ over limit |
+	> | World basemap | 0 – 7 | ~21,845 |
+	>
+	> Each additional zoom level multiplies the tile count by ~4.
+	> For large areas, keep max zoom ≤ 12. Use the World Basemap button for global coverage at zoom 0–7.
+
 7.	Download Tiles:
 
 	Click "Download Tiles" to start downloading tiles for the selected areas and zoom levels.

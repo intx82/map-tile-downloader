@@ -29,14 +29,31 @@
             box-shadow: 0 0 10px rgba(0,0,0,0.5);
         }
         #progress {
-            position: absolute;
-            top: 188px;
-            right: 11px;
-            z-index: 1000;
-            background: rgba(241, 242, 243, 0.736);
-            padding: 10px;
-            border-radius: 5px;
-            box-shadow: 2px 4px 8px rgba(0,0.2,0,0.5);
+            margin-top: 8px;
+            padding: 6px 4px 2px 4px;
+            border-top: 1px solid rgba(0,0,0,0.15);
+            font-size: 12px;
+            word-break: break-word;
+        }
+        #tile-reference {
+            font-size: 11px;
+            margin-top: 4px;
+            border-collapse: collapse;
+            width: 100%;
+        }
+        #tile-reference th, #tile-reference td {
+            text-align: left;
+            padding: 2px 6px;
+            border-bottom: 1px solid #ccc;
+        }
+        #tile-reference th {
+            background: rgba(0,0,0,0.07);
+        }
+        details summary {
+            cursor: pointer;
+            font-size: 11px;
+            color: #444;
+            margin-top: 4px;
         }
     </style>
 </head>
@@ -49,8 +66,23 @@
                 <select id="map_style" name="map_style"></select><br>
                 <label for="min_zoom">Min Zoom (0-19):</label>
                 <input type="number" id="min_zoom" name="min_zoom" min="0" max="19" value="10" required><br>
-                <label for="max_zoom">Max Zoom (0-19):</label>
+                <label for="max_zoom">Max Zoom (0-19, caution above 12):</label>
                 <input type="number" id="max_zoom" name="max_zoom" min="0" max="19" value="12" required><br>
+                <details>
+                    <summary>&#9432; Tile count reference (limit: 100,000)</summary>
+                    <table id="tile-reference">
+                        <thead><tr><th>Area</th><th>Zoom</th><th>~Tiles</th></tr></thead>
+                        <tbody>
+                            <tr><td>City</td><td>10–14</td><td>~5,000</td></tr>
+                            <tr><td>State / Region</td><td>8–12</td><td>~20,000</td></tr>
+                            <tr><td>Country (US)</td><td>0–10</td><td>~18,000</td></tr>
+                            <tr><td>Country (US)</td><td>0–12</td><td>~80,000</td></tr>
+                            <tr><td>Country (US)</td><td>0–13</td><td>~320,000 ⚠️</td></tr>
+                            <tr><td>World basemap</td><td>0–7</td><td>~21,845</td></tr>
+                        </tbody>
+                    </table>
+                    <div style="font-size:10px;margin-top:3px;">Each zoom level adds ~4× more tiles.</div>
+                </details><br>
                 <input type="checkbox" id="use_cache" name="use_cache"> Use cached tiles<br>
                 <input type="checkbox" id="convert_to_8bit" checked> Convert to 8 bit for Meshtastic UI Maps<br>
                 <input type="checkbox" id="view_cached_tiles"> View cached tiles<br>
@@ -59,8 +91,8 @@
                 <button type="button" id="cancelBtn" disabled>Cancel Download</button>
                 <button type="button" id="deleteCacheBtn">Delete Cache</button>
             </form>
+            <div id="progress">Ready</div>
         </div>
-        <div id="progress">Ready</div>
     </div>
 
     <script>
@@ -97,10 +129,16 @@
         map.on('draw:created', function(e) {
             drawnItems.addLayer(e.layer);
             document.getElementById('downloadBtn').disabled = drawnItems.getLayers().length === 0;
+            saveSettings();
         });
 
         map.on('draw:deleted', function() {
             document.getElementById('downloadBtn').disabled = drawnItems.getLayers().length === 0;
+            saveSettings();
+        });
+
+        map.on('draw:edited', function() {
+            saveSettings();
         });
 
         // Create layer groups
@@ -146,6 +184,66 @@
             }
         }
 
+        // ---- localStorage persistence ----
+        var STORAGE_KEY = 'mtd_settings';
+
+        function saveSettings() {
+            var layers = [];
+            drawnItems.eachLayer(function(layer) {
+                if (layer instanceof L.Polygon) {
+                    // Store as GeoJSON so any polygon/rectangle shape round-trips correctly
+                    layers.push(layer.toGeoJSON());
+                }
+            });
+            var settings = {
+                map_style:       document.getElementById('map_style').value,
+                min_zoom:        document.getElementById('min_zoom').value,
+                max_zoom:        document.getElementById('max_zoom').value,
+                use_cache:       document.getElementById('use_cache').checked,
+                convert_to_8bit: document.getElementById('convert_to_8bit').checked,
+                view_cached_tiles: document.getElementById('view_cached_tiles').checked,
+                polygons:        layers
+            };
+            try { localStorage.setItem(STORAGE_KEY, JSON.stringify(settings)); } catch(e) {}
+        }
+
+        function restoreSettings(savedMapStyleUrl) {
+            var raw;
+            try { raw = localStorage.getItem(STORAGE_KEY); } catch(e) {}
+            if (!raw) return;
+            var s;
+            try { s = JSON.parse(raw); } catch(e) { return; }
+
+            // Form fields
+            if (s.map_style) {
+                var select = document.getElementById('map_style');
+                for (var i = 0; i < select.options.length; i++) {
+                    if (select.options[i].value === s.map_style) { select.selectedIndex = i; break; }
+                }
+            }
+            if (s.min_zoom !== undefined) document.getElementById('min_zoom').value = s.min_zoom;
+            if (s.max_zoom !== undefined) document.getElementById('max_zoom').value = s.max_zoom;
+            if (s.use_cache !== undefined) document.getElementById('use_cache').checked = s.use_cache;
+            if (s.convert_to_8bit !== undefined) document.getElementById('convert_to_8bit').checked = s.convert_to_8bit;
+            if (s.view_cached_tiles !== undefined) document.getElementById('view_cached_tiles').checked = s.view_cached_tiles;
+
+            // Restore drawn polygons from GeoJSON
+            if (Array.isArray(s.polygons) && s.polygons.length > 0) {
+                s.polygons.forEach(function(geojson) {
+                    try {
+                        var layer = L.geoJSON(geojson).getLayers()[0];
+                        if (layer) drawnItems.addLayer(layer);
+                    } catch(e) {}
+                });
+                document.getElementById('downloadBtn').disabled = false;
+                // Fit map to restored shapes
+                map.fitBounds(drawnItems.getBounds(), { padding: [20, 20] });
+            }
+
+            updateTileLayer();
+            if (s.view_cached_tiles) showCachedTiles();
+        }
+
         // Populate map style dropdown from server
         fetch('/get_map_sources')
             .then(response => response.json())
@@ -157,15 +255,22 @@
                     option.text = name;
                     select.appendChild(option);
                 }
-                updateTileLayer(); // Set initial tile layer
+                restoreSettings(); // Restore saved settings after options are populated
             });
 
-        // Bind updateTileLayer to input changes
+        // Save on any form field change
         document.getElementById('map_style').addEventListener('change', function() {
+            saveSettings();
             updateTileLayer();
             if (document.getElementById('view_cached_tiles').checked) {
                 showCachedTiles();
             }
+        });
+        ['min_zoom', 'max_zoom'].forEach(function(id) {
+            document.getElementById(id).addEventListener('change', saveSettings);
+        });
+        ['use_cache', 'convert_to_8bit', 'view_cached_tiles'].forEach(function(id) {
+            document.getElementById(id).addEventListener('change', saveSettings);
         });
         document.getElementById('use_cache').addEventListener('change', updateTileLayer);
 
@@ -255,6 +360,10 @@
         var downloadedTiles = 0;
         var skippedTiles = 0;
         var failedTiles = 0;
+
+        socket.on('computing_tiles', function(data) {
+            document.getElementById('progress').innerHTML = `Computing tiles for zoom ${data.zoom} / ${data.max_zoom}...`;
+        });
 
         socket.on('download_started', function(data) {
             totalTiles = data.total_tiles;

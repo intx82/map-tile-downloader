@@ -83,7 +83,7 @@ def get_style_cache_dir(style_name):
     sanitized_name = sanitize_style_name(style_name)
     return CACHE_DIR / sanitized_name
 
-def download_tile(tile, map_style, style_cache_dir, convert_to_8bit, max_retries=3):
+def download_tile(tile, map_style, style_cache_dir, convert_to_8bit, sid, max_retries=3):
     """Download a single tile with retries if not cancelled and not in cache, converting to 8-bit if specified."""
     if not download_event.is_set():
         return None
@@ -96,7 +96,7 @@ def download_tile(tile, map_style, style_cache_dir, convert_to_8bit, max_retries
             'south': bounds.south,
             'east': bounds.east,
             'north': bounds.north
-        })
+        }, to=sid)
         return tile_path
     subdomain = random.choice(['a', 'b', 'c']) if '{s}' in map_style else ''
     url = map_style.replace('{s}', subdomain).replace('{z}', str(tile.z)).replace('{x}', str(tile.x)).replace('{y}', str(tile.y))
@@ -120,7 +120,7 @@ def download_tile(tile, map_style, style_cache_dir, convert_to_8bit, max_retries
                     'south': bounds.south,
                     'east': bounds.east,
                     'north': bounds.north
-                })
+                }, to=sid)
                 return tile_path
             elif response.status_code == 429:  # Rate limited — back off longer
                 time.sleep(min(2 ** (attempt + 2), 30))
@@ -130,7 +130,7 @@ def download_tile(tile, map_style, style_cache_dir, convert_to_8bit, max_retries
             time.sleep(2 ** attempt)  # Exponential backoff
     socketio.emit('tile_failed', {
         'tile': f"{tile.z}/{tile.x}/{tile.y}"
-    })
+    }, to=sid)
     return None
 
 def get_world_tiles():
@@ -142,13 +142,34 @@ def get_world_tiles():
                 tiles.append(mercantile.Tile(x, y, z))
     return tiles
 
-def get_tiles_for_polygons(polygons_data, min_zoom, max_zoom):
+MAX_TILE_COUNT = 100_000  # Hard limit to prevent runaway enumeration at high zoom levels
+
+def estimate_tile_count(west, south, east, north, min_zoom, max_zoom):
+    """Quick estimate of tile count across all zoom levels without full enumeration."""
+    total = 0
+    for z in range(min_zoom, max_zoom + 1):
+        ul = mercantile.tile(west, north, z)
+        lr = mercantile.tile(east, south, z)
+        total += (abs(lr.x - ul.x) + 1) * (abs(lr.y - ul.y) + 1)
+    return total
+
+def get_tiles_for_polygons(polygons_data, min_zoom, max_zoom, sid=None):
     """Generate list of tiles that intersect with the given polygons for the specified zoom range."""
     polygons = [Polygon([(lng, lat) for lat, lng in poly]) for poly in polygons_data]
     overall_polygon = unary_union(polygons)
     west, south, east, north = overall_polygon.bounds
+
+    estimate = estimate_tile_count(west, south, east, north, min_zoom, max_zoom)
+    if estimate > MAX_TILE_COUNT:
+        raise ValueError(
+            f"Tile count estimate ({estimate:,}) exceeds the {MAX_TILE_COUNT:,} tile limit. "
+            f"Reduce the zoom range or area size."
+        )
+
     all_tiles = []
     for z in range(min_zoom, max_zoom + 1):
+        if sid:
+            socketio.emit('computing_tiles', {'zoom': z, 'max_zoom': max_zoom}, to=sid)
         tiles = mercantile.tiles(west, south, east, north, zooms=[z])
         for tile in tiles:
             tile_bbox = mercantile.bounds(tile)
@@ -158,9 +179,9 @@ def get_tiles_for_polygons(polygons_data, min_zoom, max_zoom):
     all_tiles.sort(key=lambda tile: (tile.z, -tile.x, tile.y))
     return all_tiles
 
-def download_tiles_with_retries(tiles, map_style, style_cache_dir, convert_to_8bit):
+def download_tiles_with_retries(tiles, map_style, style_cache_dir, convert_to_8bit, sid):
     """Download all tiles in parallel using a single thread pool, retrying failed tiles with backoff."""
-    socketio.emit('download_started', {'total_tiles': len(tiles)})
+    socketio.emit('download_started', {'total_tiles': len(tiles)}, to=sid)
     max_retry_rounds = 3
     pending = list(tiles)
 
@@ -172,7 +193,7 @@ def download_tiles_with_retries(tiles, map_style, style_cache_dir, convert_to_8b
 
         with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as executor:
             futures = {
-                executor.submit(download_tile, tile, map_style, style_cache_dir, convert_to_8bit): tile
+                executor.submit(download_tile, tile, map_style, style_cache_dir, convert_to_8bit, sid): tile
                 for tile in pending
             }
             for future in as_completed(futures):
@@ -186,11 +207,11 @@ def download_tiles_with_retries(tiles, map_style, style_cache_dir, convert_to_8b
         pending = failed
         if pending and retry_round < max_retry_rounds:
             backoff = min(2 ** (retry_round + 1), 16)
-            socketio.emit('retry_started', {'attempt': retry_round + 1, 'count': len(pending)})
+            socketio.emit('retry_started', {'attempt': retry_round + 1, 'count': len(pending)}, to=sid)
             time.sleep(backoff)
 
     if download_event.is_set():
-        socketio.emit('tiles_downloaded')
+        socketio.emit('tiles_downloaded', to=sid)
 
 def create_zip(style_cache_dir, style_name):
     """Create a zip file from the style-specific cache directory in the downloads folder."""
@@ -217,49 +238,71 @@ def get_map_sources():
 @socketio.on('start_download')
 def handle_start_download(data):
     """Handle download request for tiles within polygons."""
-    try:
-        polygons_data = data['polygons']
-        min_zoom = data['min_zoom']
-        max_zoom = data['max_zoom']
-        map_style_url = data['map_style']
-        convert_to_8bit = data.get('convert_to_8bit', False)
-        style_name = next(name for name, url in MAP_SOURCES.items() if url == map_style_url)
-        style_cache_dir = get_style_cache_dir(style_name)
-        if min_zoom < 0 or max_zoom > 19 or min_zoom > max_zoom:
-            emit('error', {'message': 'Invalid zoom range (must be 0-19, min <= max)'})
-            return
-        if not polygons_data:
-            emit('error', {'message': 'No polygons provided'})
-            return
-        tiles = get_tiles_for_polygons(polygons_data, min_zoom, max_zoom)
-        download_event.set()
-        download_tiles_with_retries(tiles, map_style_url, style_cache_dir, convert_to_8bit)
-        if download_event.is_set():
-            emit('zipping_started')
-            zip_path = create_zip(style_cache_dir, style_name)
-            emit('download_complete', {'zip_url': f'/download_zip?path={zip_path}'})
-    except Exception as e:
-        print(f"Error processing download: {e}")
-        emit('error', {'message': 'An error occurred while processing your request'})
+    sid = request.sid
+    print(f"[start_download] received from sid={sid}, polygons={len(data.get('polygons', []))}, zoom={data.get('min_zoom')}-{data.get('max_zoom')}")
+
+    def run():
+        try:
+            polygons_data = data['polygons']
+            min_zoom = data['min_zoom']
+            max_zoom = data['max_zoom']
+            map_style_url = data['map_style']
+            convert_to_8bit = data.get('convert_to_8bit', False)
+            print(f"[start_download] background task running, style={map_style_url}")
+            style_name = next((name for name, url in MAP_SOURCES.items() if url == map_style_url), None)
+            if style_name is None:
+                print(f"[start_download] unknown map style: {map_style_url}")
+                socketio.emit('error', {'message': 'Unknown map style'}, to=sid)
+                return
+            style_cache_dir = get_style_cache_dir(style_name)
+            if min_zoom < 0 or max_zoom > 19 or min_zoom > max_zoom:
+                socketio.emit('error', {'message': 'Invalid zoom range (must be 0-19, min <= max)'}, to=sid)
+                return
+            if not polygons_data:
+                socketio.emit('error', {'message': 'No polygons provided'}, to=sid)
+                return
+            tiles = get_tiles_for_polygons(polygons_data, min_zoom, max_zoom, sid)
+            print(f"[start_download] {len(tiles)} tiles to download")
+            download_event.set()
+            download_tiles_with_retries(tiles, map_style_url, style_cache_dir, convert_to_8bit, sid)
+            if download_event.is_set():
+                socketio.emit('zipping_started', to=sid)
+                zip_path = create_zip(style_cache_dir, style_name)
+                socketio.emit('download_complete', {'zip_url': f'/download_zip?path={zip_path}'}, to=sid)
+        except Exception as e:
+            import traceback
+            print(f"[start_download] ERROR: {e}")
+            traceback.print_exc()
+            socketio.emit('error', {'message': f'Error: {e}'}, to=sid)
+
+    socketio.start_background_task(run)
 
 @socketio.on('start_world_download')
 def handle_start_world_download(data):
     """Handle download request for world basemap tiles (zoom 0-7)."""
-    try:
-        map_style_url = data['map_style']
-        convert_to_8bit = data.get('convert_to_8bit', False)
-        style_name = next(name for name, url in MAP_SOURCES.items() if url == map_style_url)
-        style_cache_dir = get_style_cache_dir(style_name)
-        tiles = get_world_tiles()
-        download_event.set()
-        download_tiles_with_retries(tiles, map_style_url, style_cache_dir, convert_to_8bit)
-        if download_event.is_set():
-            emit('zipping_started')
-            zip_path = create_zip(style_cache_dir, style_name)
-            emit('download_complete', {'zip_url': f'/download_zip?path={zip_path}'})
-    except Exception as e:
-        print(f"Error processing world download: {e}")
-        emit('error', {'message': 'An error occurred while processing your request'})
+    sid = request.sid
+
+    def run():
+        try:
+            map_style_url = data['map_style']
+            convert_to_8bit = data.get('convert_to_8bit', False)
+            style_name = next((name for name, url in MAP_SOURCES.items() if url == map_style_url), None)
+            if style_name is None:
+                socketio.emit('error', {'message': 'Unknown map style'}, to=sid)
+                return
+            style_cache_dir = get_style_cache_dir(style_name)
+            tiles = get_world_tiles()
+            download_event.set()
+            download_tiles_with_retries(tiles, map_style_url, style_cache_dir, convert_to_8bit, sid)
+            if download_event.is_set():
+                socketio.emit('zipping_started', to=sid)
+                zip_path = create_zip(style_cache_dir, style_name)
+                socketio.emit('download_complete', {'zip_url': f'/download_zip?path={zip_path}'}, to=sid)
+        except Exception as e:
+            print(f"Error processing world download: {e}")
+            socketio.emit('error', {'message': 'An error occurred while processing your request'}, to=sid)
+
+    socketio.start_background_task(run)
 
 @socketio.on('cancel_download')
 def handle_cancel_download():
