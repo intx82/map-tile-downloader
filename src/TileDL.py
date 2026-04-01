@@ -58,6 +58,20 @@ else:
 # Global event for cancellation
 download_event = threading.Event()
 
+# Number of parallel download workers (increase for faster downloads; tile servers may rate-limit above ~16)
+MAX_DOWNLOAD_WORKERS = 16
+
+# Shared HTTP session with connection pooling for keep-alive and reuse across threads
+_http_session = requests.Session()
+_http_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=MAX_DOWNLOAD_WORKERS,
+    pool_maxsize=MAX_DOWNLOAD_WORKERS * 2,
+    max_retries=0,  # Retries are handled manually
+)
+_http_session.mount('http://', _http_adapter)
+_http_session.mount('https://', _http_adapter)
+_http_session.headers.update({'User-Agent': 'MapTileDownloader/1.0'})
+
 def sanitize_style_name(style_name):
     """Convert map style name to a filesystem-safe directory name."""
     style_name = re.sub(r'\s+', '-', style_name)  # Replace spaces with hyphens
@@ -86,10 +100,11 @@ def download_tile(tile, map_style, style_cache_dir, convert_to_8bit, max_retries
         return tile_path
     subdomain = random.choice(['a', 'b', 'c']) if '{s}' in map_style else ''
     url = map_style.replace('{s}', subdomain).replace('{z}', str(tile.z)).replace('{x}', str(tile.x)).replace('{y}', str(tile.y))
-    headers = {'User-Agent': 'MapTileDownloader/1.0'}
     for attempt in range(max_retries):
+        if not download_event.is_set():
+            return None
         try:
-            response = requests.get(url, headers=headers, timeout=10)
+            response = _http_session.get(url, timeout=10)
             if response.status_code == 200:
                 tile_dir.mkdir(parents=True, exist_ok=True)
                 with open(tile_path, 'wb') as f:
@@ -107,6 +122,8 @@ def download_tile(tile, map_style, style_cache_dir, convert_to_8bit, max_retries
                     'north': bounds.north
                 })
                 return tile_path
+            elif response.status_code == 429:  # Rate limited — back off longer
+                time.sleep(min(2 ** (attempt + 2), 30))
             else:
                 time.sleep(2 ** attempt)  # Exponential backoff
         except requests.RequestException:
@@ -142,31 +159,36 @@ def get_tiles_for_polygons(polygons_data, min_zoom, max_zoom):
     return all_tiles
 
 def download_tiles_with_retries(tiles, map_style, style_cache_dir, convert_to_8bit):
-    """Download tiles with efficient retries using parallelism and adaptive backoff."""
+    """Download all tiles in parallel using a single thread pool, retrying failed tiles with backoff."""
     socketio.emit('download_started', {'total_tiles': len(tiles)})
-    retry_queue = []
-    max_workers = 5
-    batch_size = 10
-    
-    def process_batch(batch):
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(download_tile, tile, map_style, style_cache_dir, convert_to_8bit): tile for tile in batch}
+    max_retry_rounds = 3
+    pending = list(tiles)
+
+    for retry_round in range(max_retry_rounds + 1):
+        if not download_event.is_set() or not pending:
+            break
+        failed = []
+        failed_lock = threading.Lock()
+
+        with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as executor:
+            futures = {
+                executor.submit(download_tile, tile, map_style, style_cache_dir, convert_to_8bit): tile
+                for tile in pending
+            }
             for future in as_completed(futures):
+                if not download_event.is_set():
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
                 if future.result() is None and download_event.is_set():
-                    retry_queue.append(futures[future])
-    
-    while tiles and download_event.is_set():
-        for i in range(0, len(tiles), batch_size):
-            if not download_event.is_set():
-                break
-            batch = tiles[i:i + batch_size]
-            process_batch(batch)
-        tiles = retry_queue if retry_queue else []
-        retry_queue = []
-        if tiles:
-            delay = min(2 ** len(retry_queue), 8)
-            time.sleep(delay)
-    
+                    with failed_lock:
+                        failed.append(futures[future])
+
+        pending = failed
+        if pending and retry_round < max_retry_rounds:
+            backoff = min(2 ** (retry_round + 1), 16)
+            socketio.emit('retry_started', {'attempt': retry_round + 1, 'count': len(pending)})
+            time.sleep(backoff)
+
     if download_event.is_set():
         socketio.emit('tiles_downloaded')
 
@@ -213,6 +235,7 @@ def handle_start_download(data):
         download_event.set()
         download_tiles_with_retries(tiles, map_style_url, style_cache_dir, convert_to_8bit)
         if download_event.is_set():
+            emit('zipping_started')
             zip_path = create_zip(style_cache_dir, style_name)
             emit('download_complete', {'zip_url': f'/download_zip?path={zip_path}'})
     except Exception as e:
@@ -231,6 +254,7 @@ def handle_start_world_download(data):
         download_event.set()
         download_tiles_with_retries(tiles, map_style_url, style_cache_dir, convert_to_8bit)
         if download_event.is_set():
+            emit('zipping_started')
             zip_path = create_zip(style_cache_dir, style_name)
             emit('download_complete', {'zip_url': f'/download_zip?path={zip_path}'})
     except Exception as e:

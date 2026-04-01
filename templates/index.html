@@ -285,6 +285,10 @@
             updateProgress();
         });
 
+        socket.on('retry_started', function(data) {
+            document.getElementById('progress').innerHTML += `<br>Retrying ${data.count} failed tile(s) (attempt ${data.attempt})...`;
+        });
+
         socket.on('tiles_downloaded', function() {
             document.getElementById('progress').innerHTML += '<br>Tiles downloaded, preparing zip...';
         });
